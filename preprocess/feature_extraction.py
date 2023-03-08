@@ -6,9 +6,9 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import logging
 import ast
-import cleaning
-from cleaning import light_preprocessing, remove_bad_channels_kevin
-from cleaning import all_batch_1_edfs
+import preprocess.cleaning as cleaning
+from preprocess.cleaning import light_preprocessing, remove_bad_channels_kevin
+from preprocess.cleaning import all_batch_1_edfs
 from collections import defaultdict
 from tqdm import tqdm
 import time
