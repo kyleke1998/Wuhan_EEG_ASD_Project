@@ -177,7 +177,7 @@ for j, (train_val_idx, test_idx) in enumerate(outer_cv_splits):
     clf = GridSearchCV(estimator=lr, param_grid=param_grid, cv=inner_cv,n_jobs=-1,scoring='roc_auc')
     splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=42)
     # Initialize the SequentialFeatureSelector with cv=None
-    sfs = SequentialFeatureSelector(clf, n_features_to_select=1, cv=splitter,n_jobs=-1)
+    sfs = SequentialFeatureSelector(clf, n_features_to_select=10, cv=splitter,n_jobs=-1)
 
 
     # Fit the SequentialFeatureSelector on the train data
