@@ -117,8 +117,6 @@ def repeated_elastic_net_select_features(X, y):
 mlflow.set_experiment("Logistic Regression Greedy Forward Selection")
 
 
-
-
 feature_list = []  
 
 X = df.copy(deep=True)[full_features]
@@ -171,9 +169,9 @@ for j, (train_val_idx, test_idx) in enumerate(outer_cv_splits):
     param_grid = {'C': [0.0001,0.001, 0.01, 0.1, 1, 10, 100]}
 
     clf = GridSearchCV(estimator=lr, param_grid=param_grid, cv=inner_cv,n_jobs=-1,scoring='roc_auc')
-    #splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=42)
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=42)
     # Initialize the SequentialFeatureSelector with cv=None
-    sfs = SequentialFeatureSelector(clf, n_features_to_select=1, cv=splitter,n_jobs=-1)
+    sfs = SequentialFeatureSelector(clf, n_features_to_select=10, cv=splitter,n_jobs=-1)
 
 
     # Fit the SequentialFeatureSelector on the train data
@@ -262,9 +260,9 @@ with mlflow.start_run(run_name='greedy_forward_lr',nested=True):
         mlflow.log_metric('accuracy', mean_nested_accuracy)
 
 mlflow.end_run()
-    
+# save coefficent matrix
 pd.DataFrame(coefficent_matrix).to_csv('coefficeint_matrix_forward_greedy_lr.csv',index=False)
-
+# save feature list 
 pd.DataFrame(feature_list).to_csv('selected_features_forward_greedy_lr.csv',index=False)
 
 
