@@ -1,11 +1,11 @@
 import mne
 import pandas as pd
 import numpy as np
-import os.path as op
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import logging
 import ast
+import os
 import cleaning
 from cleaning import light_preprocessing, remove_bad_channels_kevin, metadata
 from cleaning import all_batch_1_edfs, subjects_to_remove
@@ -20,6 +20,7 @@ import itertools
 import logging
 from mne_features.univariate import compute_samp_entropy, compute_mean, compute_std, compute_kurtosis, compute_skewness
 import philistine
+
 
 
 
@@ -394,7 +395,7 @@ def extract_length_after_dropped_epoch(subject):
     # Segment the raw data into epochs
     # epochs shape (n_epochs, n_channels, n_times)
     reject = dict(
-              eeg=500e-6,      # unit: V (EEG channels)
+              eeg=1000e-6,      # unit: V (EEG channels)
               )
 
     flat = dict(eeg = 0.1e-6)
@@ -423,6 +424,10 @@ length_df_list = Parallel(n_jobs=-1)(
 
 end_time = time.time()
 print(end_time - start_time)
+
+length_df_list = []
+for subject in good_subjects:
+    length_df_list.append(extract_length_after_dropped_epoch(subject))
 
 length_df = pd.concat(length_df_list , axis=0)
 

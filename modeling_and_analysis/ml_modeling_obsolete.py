@@ -55,21 +55,20 @@ y = df['trt']
 mlflow.set_experiment("Logistic Regression Nested CV IPW EO")
 
 
-
+nested_roc_auc = np.zeros(10)
 ##################################
 # Logistic Regression 
 ###################################
 def logistic_regression_nested_cv(feature_list,X,y,num_run):
 
     X = X.copy(deep=True)[feature_list]
-    
     numeric_cols = [col for col in feature_list if col not in [ 'sex']]
-    categorical_cols = [ 'sex']
+    categorical_cols = ['sex']
 
     # Initialize the array to store the nested scores
     nested_sensitivity = np.zeros(10)
     nested_specificity = np.zeros(10)
-    nested_roc_auc = np.zeros(10)
+    #nested_roc_auc = np.zeros(10)
     nested_f1_macro = np.zeros(10)
     nested_accuracy = np.zeros(10)
 
@@ -98,7 +97,7 @@ def logistic_regression_nested_cv(feature_list,X,y,num_run):
         X_train_val = pipeline.fit_transform(X_train_val)
 
         # Apply the pipeline on the testing set
-        X_test = pipeline.fit_transform(X_test)
+        X_test = pipeline.transform(X_test)
 
         # Define the indices for the inner loop splits
         
@@ -159,7 +158,7 @@ for i in tqdm(range(len(top_50_features[44:]))):
     features = features + ['age_months','sex']
     logistic_regression_nested_cv(features,df,y,num_run=i+44)
 
-logistic_regression_nested_cv(['age_months','sex'],df,y,num_run=-1)
+logistic_regression_nested_cv(features,df,y,num_run=-1)
 
 
 
@@ -200,8 +199,7 @@ def dt_nested_cv(feature_list,X,y,num_run):
 
         preprocessor = ColumnTransformer(
         transformers=[
-        ('num', StandardScaler(), numeric_cols),
-        ('cat', OneHotEncoder(), categorical_cols)
+        ('num', StandardScaler(), numeric_cols)
         ])
 
         steps = [('preprocessor',preprocessor), ('impute', KNNImputer(n_neighbors=3))]

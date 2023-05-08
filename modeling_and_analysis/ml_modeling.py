@@ -23,6 +23,9 @@ from mrmr import mrmr_classif
 import mlflow
 import lightgbm
 from joblib import Parallel, delayed
+from sklearn.preprocessing import LabelEncoder
+from sklearn.impute import SimpleImputer
+
 
 
 
@@ -40,7 +43,8 @@ FEATURES_TO_EXCLUDE = ["subject_x","subject_y",
 
 # Loading in data
 df = pd.read_csv('../features/features_ml_eo.csv') # load data
-df['sex'] = df['sex'].apply(lambda x: 1 if x == 'm' else 0)
+#df['sex'] = df['sex'].apply(lambda x: 1 if x == 'm' else 0)
+
 
 
 
@@ -49,7 +53,7 @@ full_features = [col for col in df.columns if col not in FEATURES_TO_EXCLUDE]
 full_features = full_features + ['sex','age_months']
 
 y = df['trt']
-features_df = df[full_features]
+
 
 
 
@@ -110,14 +114,26 @@ def repeated_elastic_net_select_features(X, y):
 #############################################
 #Greedy forward selection Logistic Regression#
 #############################################
+mlflow.set_experiment("Logistic Regression Greedy Forward Selection")
+
+
 
 
 feature_list = []  
 
 X = df.copy(deep=True)[full_features]
+le = LabelEncoder()
+X['sex'] = le.fit_transform(X['sex'])
 
-numeric_cols = [col for col in full_features if col not in ['sex','alpha_presence']]
+coefficent_matrix = np.zeros((10,len(full_features)))
 
+# Initialize the array to store the nested scores
+nested_sensitivity = np.zeros(10)
+nested_specificity = np.zeros(10)
+nested_roc_auc = np.zeros(10)
+nested_f1_macro = np.zeros(10)
+nested_accuracy = np.zeros(10)
+nested_C = np.zeros(10)
 
 
 # Define the indices for the outer loop splits
@@ -132,70 +148,106 @@ for j, (train_val_idx, test_idx) in enumerate(outer_cv_splits):
     X_train_val, y_train_val = X.loc[train_val_idx,:], y[train_val_idx]
     X_test, y_test = X.loc[test_idx,:], y[test_idx]
 
+    features = X_train_val.columns 
 
-    numeric_cols = [col for col in full_features if col not in ['sex', 'alpha_presence']]
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ('num', StandardScaler(), numeric_cols),
-            ('passthrough', 'passthrough', ['sex', 'alpha_presence'])  # Add a passthrough transformer
-        ])
-
-    steps = [('preprocessor',preprocessor), ('impute', KNNImputer(n_neighbors=3))]
+    steps = [('mean_impute', SimpleImputer(strategy='mean'))]
+    #steps = [('impute', KNNImputer(n_neighbors=3))]
     pipeline = Pipeline(steps=steps)
 
     # Apply the pipeline on the training/validation set
-    X_train_val = pipeline.fit_transform(X_train_val)
+    X_train_val_transformed = pipeline.fit_transform(X_train_val)
 
 
     # Apply the pipeline on the testing set
-    X_test = pipeline.transform(X_test)
+    X_test_transformed = pipeline.transform(X_test)
 
 
 
     # Define the indices for the inner loop splits
-    inner_cv =  RepeatedStratifiedKFold(n_splits=10, random_state=42, n_repeats=1)
+    inner_cv =  RepeatedStratifiedKFold(n_splits=10, random_state=42, n_repeats=3)
 
     # Define the estimator and the parameter grid for GridSearchCV
     lr = LogisticRegression(class_weight='balanced',max_iter=1000)
-    param_grid = {'C': [0.0001,0.001, 0.01, 0.1]}
+    param_grid = {'C': [0.0001,0.001, 0.01, 0.1, 1, 10, 100]}
 
     clf = GridSearchCV(estimator=lr, param_grid=param_grid, cv=inner_cv,n_jobs=-1,scoring='roc_auc')
-    splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=42)
+    #splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=42)
     # Initialize the SequentialFeatureSelector with cv=None
-    sfs = SequentialFeatureSelector(clf, n_features_to_select=10, cv=splitter,n_jobs=-1)
+    sfs = SequentialFeatureSelector(clf, n_features_to_select=1, cv=splitter,n_jobs=-1)
 
 
     # Fit the SequentialFeatureSelector on the train data
-    sfs.fit(X_train_val , y_train_val)
+    sfs.fit(X_train_val_transformed , y_train_val)
 
-    selected_features = sfs.get_feature_names_out(input_features=full_features)
-    feature_list.append(selected_features)
-    selected_features = np.append(selected_features,['sex','age_months'])
+    # Get selected features
+    selected_features = sfs.get_feature_names_out(input_features=features)
+    #selected_features = benchmark_features
 
-    # get only unique features
-    selected_features = list(set(selected_features))
-    # get index of selected features
-    selected_feature_indices = [df[full_features].columns.get_loc(feature) for feature in selected_features]
 
-    X_train_val = X_train_val[:,selected_feature_indices]
-  
-    X_test = X_test[:,selected_feature_indices]
-    sfs.estimator.fit(X_train_val, y_train_val)
-    y_pred_proba = sfs.estimator.best_estimator_.predict_proba(X_test)[:,1]
-    y_pred = sfs.estimator.best_estimator_.predict(X_test)
+
     
+    feature_list.append(selected_features)
+
+    selected_features = np.append(selected_features,['sex','age_months'])
+    selected_features = list(set(selected_features))
+
+    # subset to the selected features
+    
+    # get index of selected features
+    selected_feature_indices = [X_train_val.columns.get_loc(feature) for feature in selected_features]
+    
+    X_train_val_transformed = X_train_val_transformed[:,selected_feature_indices]
+    X_test_transformed = X_test_transformed[:,selected_feature_indices]
+    
+    
+    """
+    X_train_val = X_train_val[selected_features]
+    X_test = X_test[selected_features]
+
+    # Apply the pipeline on the training/validation set
+    X_train_val_transformed = pipeline.fit_transform(X_train_val)
+
+
+    # Apply the pipeline on the testing set
+    X_test_transformed = pipeline.transform(X_test)
+    """
+  
+
+    # reinstaniate a gridsearchcv
+    clf.fit(X_train_val_transformed, y_train_val)
+  
+    # update coefficent matrix
+    coefs = clf.best_estimator_.coef_[0]
+
+    # update the coefficient matrix
+    coefficent_matrix[j, selected_feature_indices] = coefs  
    
  
-    y_pred = clf.predict(X_test)
-    y_pred_proba = clf.predict_proba(X_test)[:,1]
+    y_pred = clf.predict(X_test_transformed)
+    y_pred_proba = clf.predict_proba(X_test_transformed)[:,1]
+
+
+    sensitivity = recall_score(y_test, y_pred, pos_label=1)
+    specificity = recall_score(y_test, y_pred, pos_label=0)
+    roc_auc = roc_auc_score(y_test, y_pred_proba)
+
+    f1_macro = f1_score(y_test, y_pred, average='macro')
+    accuracy = accuracy_score(y_test, y_pred)
     
+    # Store the scores in the array
+    nested_sensitivity[j] = sensitivity
+    nested_specificity[j] = specificity
+    nested_roc_auc[j] = roc_auc
+    nested_f1_macro[j] = f1_macro
+    nested_accuracy[j] = accuracy
+
 
     print("Finished ",j)
 
 with mlflow.start_run(run_name='greedy_forward_lr',nested=True):   
 
         # Log the features used
-        mlflow.log_param("C", sfs.estimator.best_params_['C'])
+        mlflow.log_param("C", clf.best_params_['C'])
 
         # Compute the mean and the standard deviation of the nested scores
         mean_nested_sensitivity = nested_sensitivity.mean()
@@ -211,12 +263,14 @@ with mlflow.start_run(run_name='greedy_forward_lr',nested=True):
 
 mlflow.end_run()
     
+pd.DataFrame(coefficent_matrix).to_csv('coefficeint_matrix_forward_greedy_lr.csv',index=False)
+
+pd.DataFrame(feature_list).to_csv('selected_features_forward_greedy_lr.csv',index=False)
+
 
 ################################################
 #Greedy forward selection Logistic Regression Ends#                          
 #################################################
-
-
 
 
 
@@ -409,6 +463,9 @@ mlflow.end_run()
 
 
 
+benchmark_features = ['gamma_coh_P4_F4','kurt_Pz', 'kurt_P3','gamma_coh_P4_F3', 'beta_coh_P4_F4',       
+                       'kurt_C4', 'gamma_coh_P4_C3','beta_coh_P4_F3','skew_F7',
+                       'alpha_coh_P4_F4','beta_coh_P4_C3','sex','age_months']
 
 
 
@@ -423,8 +480,9 @@ mlflow.end_run()
 feature_list = [] 
 
 X = df.copy(deep=True)[full_features]
-
-numeric_cols = [col for col in full_features if col not in ['sex','alpha_presence']]
+le = LabelEncoder()
+X['sex'] = le.fit_transform(X['sex'])
+numeric_cols = [col for col in full_features if col not in ['sex_male','alpha_presence']]
 
 # Initialize the array to store the nested scores
 nested_sensitivity = np.zeros(10)
@@ -437,8 +495,8 @@ nested_C = np.zeros(10)
 # Define the indices for the outer loop splits
 
 
-outer_cv = StratifiedKFold(n_splits=10, random_state=10, shuffle=True)
-outer_cv_splits = outer_cv.split(features_df, y)
+outer_cv = StratifiedKFold(n_splits=10, random_state=7, shuffle=True)
+outer_cv_splits = outer_cv.split(X, y)
 
 
 
@@ -449,23 +507,25 @@ for j, (train_val_idx, test_idx) in enumerate(outer_cv_splits):
     X_train_val, y_train_val = X.loc[train_val_idx,:], y[train_val_idx]
     X_test, y_test = X.loc[test_idx,:], y[test_idx]
 
-    # Perform maximum relevance minimum redundancy feature selection
-    selected_features = mrmr_classif(X_train_val, y_train_val, K = 10)
-    #selected_features = list(set(selected_features + ['sex','age_months']))
-    # Get selected feature indices,
-    selected_feature_indices = [X_train_val.columns.get_loc(feature) for feature in selected_features]
     
+    # Perform maximum relevance minimum redundancy feature selection
+    #selected_features = mrmr_classif(X_train_val, y_train_val, K = 10)
+    #selected_features = list(set(selected_features + ['sex','age_months']))
+    selected_features = benchmark_features
+    # Get selected feature indices,
+    #selected_feature_indices = [X_train_val.columns.get_loc(feature) for feature in selected_features]
+    X_train_val = X_train_val[selected_features]
+    X_test = X_test[selected_features]
    
+
+
+
     feature_list.append(selected_features)
     
-    numeric_cols = [col for col in full_features if col not in ['sex', 'alpha_presence']]
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ('num', StandardScaler(), numeric_cols),
-            ('passthrough', 'passthrough', ['sex', 'alpha_presence'])  # Add a passthrough transformer
-        ])
+    numeric_cols = [col for col in X_train_val.columns if col not in ['sex', 'alpha_presence']]
+    
 
-    steps = [('preprocessor',preprocessor), ('impute', KNNImputer(n_neighbors=3))]
+    steps = [('impute', KNNImputer(n_neighbors=3))]
     pipeline = Pipeline(steps=steps)
 
     # Apply the pipeline on the training/validation set
@@ -473,21 +533,19 @@ for j, (train_val_idx, test_idx) in enumerate(outer_cv_splits):
 
 
     # Apply the pipeline on the testing set
-    X_test = pipeline.fit_transform(X_test)
+    X_test = pipeline.transform(X_test)
 
-    # Subset X_train_val and X_test to the selected features
+    print(X_test.shape)
+   
 
-
-    X_train_val = X_train_val[:, selected_feature_indices]
-    X_test = X_test[:, selected_feature_indices]
-    
+  
     # Define the indices for the inner loop splits
     
-    inner_cv =  RepeatedStratifiedKFold(n_splits=10, random_state=42, n_repeats=1)
+    inner_cv =  RepeatedStratifiedKFold(n_splits=10, random_state=42, n_repeats=3)
 
     # Define the estimator and the parameter grid for GridSearchCV
     lr = LogisticRegression(class_weight='balanced',max_iter=1000)
-    param_grid = {'C': [0.0001,0.001, 0.01, 0.1]}
+    param_grid = {'C': [0.0001,0.001, 0.01, 0.1, 1, 10, 100]}
 
     clf = GridSearchCV(estimator=lr, param_grid=param_grid, cv=inner_cv,n_jobs=-1,scoring='roc_auc')
     clf.fit(X_train_val, y_train_val)

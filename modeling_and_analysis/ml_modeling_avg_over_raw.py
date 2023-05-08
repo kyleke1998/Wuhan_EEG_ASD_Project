@@ -23,7 +23,7 @@ from mrmr import mrmr_classif
 import mlflow
 import lightgbm
 from joblib import Parallel, delayed
-
+from sklearn.preprocessing import LabelEncoder
 
 
 os.chdir("c:/Users/kylek/Dropbox (Partners HealthCare)/eeg_asd_project/Code")
@@ -41,6 +41,12 @@ FEATURES_TO_EXCLUDE = ["subject_x","subject_y",
 # Loading in data
 df = pd.read_csv('../features/features_ml_eo.csv') # load data
 df['sex'] = df['sex'].apply(lambda x: 1 if x == 'm' else 0)
+
+edf_files = ["125.edf", "1106.edf", "1114.edf", "161.edf", "1089.edf", "092.edf", "1110.edf", "1045.edf", "352.edf", "126.edf", "209.edf", "035.edf", "335.edf", "7006.edf", "1078.edf", "403.edf", 
+             "093.edf", "146.edf", "1021.edf", "284.edf", "325.edf", 
+             "290.edf", "033.edf", "1069.edf", "1133.edf", "1013.edf", "218.edf", "7064.edf", "7113.edf", "7011.edf", "089.edf", "065.edf", "7046.edf", "1044.edf", "112.edf"]
+mask = df['file_name'].isin(edf_files)
+
 
 
 
@@ -215,7 +221,7 @@ for j, (train_val_idx, test_idx) in enumerate(outer_cv_splits):
 
 # save 10 x 10 coefficent matrix
 
-pd.DataFrame(np.array(feature_list)).to_csv('selected_features_forward_greedy_lr.csv',index=False)
+pd.DataFrame(coefficent_matrix).to_csv('selected_features_forward_greedy_lr.csv',index=False)
 
 with mlflow.start_run(run_name='greedy_forward_lr',nested=True):   
 
@@ -456,7 +462,8 @@ mlflow.end_run()
 feature_list = [] 
 
 X = df.copy(deep=True)[full_features]
-
+le = LabelEncoder()
+X['sex'] = le.fit_transform(X['sex'])
 numeric_cols = [col for col in full_features if col not in ['sex','alpha_presence']]
 
 y_true_list = []  # true labels for all folds
@@ -465,8 +472,8 @@ y_pred_list = []
 
 
 # Define the indices for the outer loop splits
-outer_cv = StratifiedKFold(n_splits=10, random_state=10, shuffle=True)
-outer_cv_splits = outer_cv.split(features_df, y)
+outer_cv = StratifiedKFold(n_splits=10, random_state=7, shuffle=True)
+outer_cv_splits = outer_cv.split(X, y)
 coefficent_matrix = np.zeros((10,len(full_features)))
   
 
@@ -478,19 +485,21 @@ for j, (train_val_idx, test_idx) in enumerate(outer_cv_splits):
     X_test, y_test = X.loc[test_idx,:], y[test_idx]
 
     # Perform maximum relevance minimum redundancy feature selection
-    selected_features = mrmr_classif(X_train_val, y_train_val, K = 10)
-    selected_features = list(set(selected_features + ['sex','age_months']))
-    # Get selected feature indices,
-    selected_feature_indices = [X_train_val.columns.get_loc(feature) for feature in selected_features]
+    #selected_features = mrmr_classif(X_train_val, y_train_val, K = 10)
+    #selected_features = list(set(selected_features + ['sex','age_months']))
+    selected_features = features
+    X_train_val = X_train_val[selected_features]
+    X_test = X_test[selected_features]
+   
     
    
     feature_list.append(selected_features)
     
-    numeric_cols = [col for col in full_features if col not in ['sex', 'alpha_presence']]
+    numeric_cols = [col for col in X_train_val.columns if col not in ['sex', 'alpha_presence']]
     preprocessor = ColumnTransformer(
         transformers=[
             ('num', StandardScaler(), numeric_cols),
-            ('passthrough', 'passthrough', ['sex', 'alpha_presence'])  # Add a passthrough transformer
+            ('passthrough', 'passthrough', ['sex'])  # Add a passthrough transformer
         ])
 
     steps = [('preprocessor',preprocessor), ('impute', KNNImputer(n_neighbors=3))]
@@ -503,11 +512,7 @@ for j, (train_val_idx, test_idx) in enumerate(outer_cv_splits):
     # Apply the pipeline on the testing set
     X_test = pipeline.transform(X_test)
 
-    # Subset X_train_val and X_test to the selected features
 
-
-    X_train_val = X_train_val[:, selected_feature_indices]
-    X_test = X_test[:, selected_feature_indices]
     
     # Define the indices for the inner loop splits
     

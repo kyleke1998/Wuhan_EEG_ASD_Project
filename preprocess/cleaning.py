@@ -8,7 +8,7 @@ import logging
 import ast
 
 
-os.chdir("c:/Users/kylek/Dropbox (Partners HealthCare)/eeg_asd_project/Code")
+os.chdir("c:/Users/kylek/Dropbox (Partners HealthCare)/eeg_asd_project/Code/")
 
 
 path = '../eeg_data/main_edf'
@@ -47,7 +47,7 @@ control_subjects = good_metadata.query("exp_group != 'ASD'")['file_name'].values
 
 
 # Get all bad channels from claned data identified by Kevin
-channels_to_drop_dict_from_kevin = pd.read_csv('channel_to_drop_kevin_dict.csv',sep=',')
+channels_to_drop_dict_from_kevin = pd.read_csv('channel_to_drop_dict.csv',sep=',')
 channels_to_drop_dict_from_kevin['Value'] = channels_to_drop_dict_from_kevin['Value'].apply(lambda x: ast.literal_eval(x))
 channels_to_drop_dict_from_kevin = channels_to_drop_dict_from_kevin.set_index('Key').to_dict(orient='dict')['Value']
 
