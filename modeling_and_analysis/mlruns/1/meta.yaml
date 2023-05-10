@@ -1,0 +1,6 @@
+artifact_location: file:///data/interesting_side_projects/Wuhan_EEG_ASD_Project/modeling_and_analysis/mlruns/1
+creation_time: 1683660752290
+experiment_id: '1'
+last_update_time: 1683660752290
+lifecycle_stage: active
+name: Logistic Regression Greedy Forward Selection

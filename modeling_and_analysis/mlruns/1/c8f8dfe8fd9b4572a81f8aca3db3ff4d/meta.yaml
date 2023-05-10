@@ -1,0 +1,15 @@
+artifact_uri: file:///data/interesting_side_projects/Wuhan_EEG_ASD_Project/modeling_and_analysis/mlruns/1/c8f8dfe8fd9b4572a81f8aca3db3ff4d/artifacts
+end_time: 1683735557759
+entry_point_name: ''
+experiment_id: '1'
+lifecycle_stage: active
+run_id: c8f8dfe8fd9b4572a81f8aca3db3ff4d
+run_name: greedy_forward_lr
+run_uuid: c8f8dfe8fd9b4572a81f8aca3db3ff4d
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1683735557738
+status: 3
+tags: []
+user_id: sunhaoqi
