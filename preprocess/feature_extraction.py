@@ -102,7 +102,7 @@ def load_clean_epochs(
 
 
 # -----------------------------
-# Feature extractors (names unchanged)
+# Feature extractors
 # -----------------------------
 def extract_relative_power(
     subject,
@@ -340,7 +340,9 @@ def extract_length_after_dropped_epoch(
     )
 
 
-
+# -----------------------------
+# Parallel processing functions #
+# -----------------------------
 def _safe_parallel_map(fn, subjects, n_jobs, desc):
     """Run a function over subjects in parallel"""
     results = Parallel(n_jobs=n_jobs)(
