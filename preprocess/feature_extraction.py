@@ -1,676 +1,508 @@
-import mne
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
-import logging
-import ast
 import os
-import cleaning
-from cleaning import light_preprocessing, remove_bad_channels_kevin, metadata
-from cleaning import all_batch_1_edfs, subjects_to_remove
-from collections import defaultdict
-from tqdm import tqdm
+import sys
+import glob
 import time
-from joblib import Parallel, delayed
-from mne_connectivity import spectral_connectivity_epochs
-from mne_connectivity.viz import plot_sensors_connectivity
-from mne.datasets import sample
-import itertools
+import argparse
 import logging
-from mne_features.univariate import compute_samp_entropy, compute_mean, compute_std, compute_kurtosis, compute_skewness
-import philistine
+from collections import defaultdict
+import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed
+from tqdm import tqdm
+import mne
+from mne_connectivity import spectral_connectivity_epochs
+from mne_features.univariate import (
+    compute_samp_entropy,
+    compute_mean,
+    compute_std,
+    compute_kurtosis,
+    compute_skewness,
+)
+import philistine  # for alpha presence 
 
 
+BAND_NAMES = ["delta", "theta", "alpha", "beta", "gamma"]
+BAND_RANGE = {
+    "delta": (1, 4),
+    "theta": (4, 8),
+    "alpha": (8, 13),
+    "beta": (13, 30),
+    "gamma": (30, 42),
+}
 
-
-BAND_NAMES = ['delta', 'theta', 'alpha', 'beta', 'gamma']
-BAND_RANGE = {'delta': (1,4), 'theta':(4,8), 'alpha': (8, 13), 'beta': (13, 30), 'gamma': (30, 42)}
-CHANNEL_NAMES ={0: 'Fp1',1: 'F3',2: 'C3',3: 'P3',4: 'O1',5: 'F7',6: 'T3',7: 'T5',8: 'Fz',9: 'Fp2',10: 'F4',11: 'C4',12: 'P4',13: 'O2',14: 'F8',15: 'T4',16: 'T6',17: 'Cz',18: 'Pz'}
+CHANNEL_NAMES = {
+    0: "Fp1", 1: "F3", 2: "C3", 3: "P3", 4: "O1", 5: "F7", 6: "T3", 7: "T5",
+    8: "Fz", 9: "Fp2", 10: "F4", 11: "C4", 12: "P4", 13: "O2", 14: "F8",
+    15: "T4", 16: "T6", 17: "Cz", 18: "Pz"
+}
 CHANNEL_NAMES_LIST = list(CHANNEL_NAMES.values())
 
-subjects_to_remove = ['002.edf',
- '039.edf',
- '052.edf',
- '069.edf',
- '159.edf',
- '390.edf',
- '1064.edf',
- '7060.edf',
- '7089.edf',
- '7104.edf']
+DEFAULT_EPOCH_LENGTH = 10  # seconds
+DEFAULT_OVERLAP = 2        # seconds
+DEFAULT_REJECT = dict(eeg=1000e-6)
+DEFAULT_FLAT = dict(eeg=0.1e-6) #max peak-to-peak signal amplitude > 1000e-6 and min PTP < 0.1e-6
 
-# the subjects that are not dropped 
-good_subjects = list(set(all_batch_1_edfs) - set(subjects_to_remove))
+### Preprocessing functions
+def light_preprocessing(raw):
+    """
+    This function changes LE to A1, drops A1 and A2,
+    keeps only EEG channels, applies montage, and filters.
+    """
+    channel_renaming_dict = {name: name.replace('-LE', '-A1') for name in raw.ch_names}
+    raw.rename_channels(mapping=channel_renaming_dict)
+
+    channel_renaming_dict = {name: name.replace('-A1', '') for name in raw.ch_names}
+    raw.rename_channels(mapping=channel_renaming_dict)
+
+    raw.pick_types(eeg=True)
+
+    if 'A2' in raw.ch_names:
+        raw.drop_channels('A2')
+
+    # Notch filtering for line noise at 50Hz
+    raw.notch_filter(50)
+
+    # Bandpass filter 0.5–42 Hz
+    raw.filter(l_freq=0.5, h_freq=42)
+
+    # Average reference
+    raw.set_eeg_reference(ref_channels='average')
+
+    return raw.copy()
+
+# -----------------------------
+# Utility helpers
+# -----------------------------
+def edf_path(data_root: str, subject: str) -> str:
+    return os.path.join(data_root, subject)
 
 
-
-
-
-
-
-###############
-# Parallelized  extract relative power
-###############
-
-def extract_relative_power(subject):
-    raw = mne.io.read_raw_edf('../eeg_data/main_edf/{}'.format(subject), infer_types=True, preload=True, misc=['Status'])
+def load_clean_epochs(
+    data_root: str,
+    subject: str,
+    epoch_length: int = DEFAULT_EPOCH_LENGTH,
+    overlap: int = DEFAULT_OVERLAP,
+    reject: dict = DEFAULT_REJECT,
+    flat: dict = DEFAULT_FLAT,
+):
+    raw_path = edf_path(data_root, subject)
+    raw = mne.io.read_raw_edf(raw_path, infer_types=True, preload=True, misc=["Status"])
     cleaned = light_preprocessing(raw)
-    cleaned = remove_bad_channels_kevin(cleaned,subject)
 
-    epoch_length = 10  # seconds
-    overlap = 2 # seconds
+    epochs = mne.make_fixed_length_epochs(
+        cleaned, duration=epoch_length, overlap=overlap, preload=True
+    )
+    # Count before drop in case a function needs it
+    n_before = len(epochs)
 
-    # Segment the raw data into epochs
-    # epochs shape (n_epochs, n_channels, n_times)
-    reject = dict(
-              eeg=1000e-6,      # unit: V (EEG channels)
-              )
-
-    flat = dict(eeg = 0.1e-6)
-
-    epochs = mne.make_fixed_length_epochs(cleaned,duration=epoch_length,overlap=overlap,preload=True)
-   
     epochs.drop_bad(reject=reject, flat=flat, verbose=None)
-    if epochs.get_data().shape[0] < 1:
+    n_after = len(epochs)
+
+    return cleaned, epochs, n_before, n_after
+
+
+# -----------------------------
+# Feature extractors (names unchanged)
+# -----------------------------
+def extract_relative_power(
+    subject,
+    data_root: str = "../eeg_data/main_edf",
+    epoch_length: int = DEFAULT_EPOCH_LENGTH,
+    overlap: int = DEFAULT_OVERLAP,
+):
+    """ Extracts relative power spectral density for each band in each channel averaged across epochs."""
+    cleaned, epochs, _, _ = load_clean_epochs(data_root, subject, epoch_length, overlap)
+    if len(epochs) < 1:
         return None
 
     df_features = defaultdict(list)
 
     for i in range(len(epochs)):
-        signal_i = epochs.get_data()[i,:,:] # shape = (n_channels, n_times)
-        #good_channel_ids = np.where(~np.all(np.isnan(signal_i), axis=1))[0]
-        psd_i, freq_i = mne.time_frequency.psd_array_multitaper(signal_i, epochs[i].info['sfreq'], fmin=0.5, fmax=42)
-        psd_i /= np.sum(psd_i, axis=-1, keepdims=True)
-        # psd_i.shape = (n_good_channels, n_frequencies)
-        # band power
-        df_features['subject'].append(subject)
-        df_features['epoch'].append(i)
+        signal_i = epochs.get_data()[i, :, :]  # (n_channels, n_times)
+        psd_i, freq_i = mne.time_frequency.psd_array_multitaper(
+            signal_i, epochs.info["sfreq"], fmin=0.5, fmax=42
+        )
+        # Relative power normalization across frequency bins per channel
+        denom = np.sum(psd_i, axis=-1, keepdims=True)
+        denom[denom == 0] = np.nan
+        psd_i = psd_i / denom
+
+        df_features["subject"].append(subject)
+        df_features["epoch"].append(i)
+        # For each frequency band, sum the relative PSD over the band’s frequency range.
         for bn in BAND_NAMES:
-            band = BAND_RANGE[bn]
-            # Find closest indices of band in frequency vector
-            idx_band = np.logical_and(freq_i >= band[0], freq_i <= band[1])
-            # Average power over frequencies
-            power = psd_i[:, idx_band].sum(axis=1) #np.mean(np.diff(freq_i[idx_band])) # power.shape=(n_channels,)
+            fmin, fmax = BAND_RANGE[bn]
+            idx_band = (freq_i >= fmin) & (freq_i <= fmax)
+            power = np.nansum(psd_i[:, idx_band], axis=1)  # (n_channels,)
             for ch in range(len(cleaned.ch_names)):
-                df_features[f'bp_{bn}_{CHANNEL_NAMES[ch]}'].append(power[ch])
+                df_features[f"bp_{bn}_{CHANNEL_NAMES[ch]}"].append(power[ch] if ch < len(power) else np.nan) # bp_alpha_Fp1
+
     df_features = pd.DataFrame(df_features)
-    result = df_features.iloc[:, 2:].mean(axis=0).to_frame().T
-    result['subject'] = subject
+    result = df_features.iloc[:, 2:].mean(axis=0).to_frame().T  # average across epochs
+    result["subject"] = subject
     return result
 
 
+def extract_spectral_coh(
+    subject,
+    data_root: str = "../eeg_data/main_edf",
+    epoch_length: int = DEFAULT_EPOCH_LENGTH,
+    overlap: int = DEFAULT_OVERLAP,
+):
+    """ Extracts channel-to-channel spectral coherence averaged across epochs for each channel pair for each band."""
 
-start_time = time.time()
-feature_df_list = Parallel(n_jobs=-1)(
-    delayed(extract_relative_power)(subject) for subject in good_subjects)
-
-end_time = time.time()
-print(end_time - start_time)
-
-all_features = pd.concat(feature_df_list, axis=0)
-
-all_features.reset_index().to_feather('all_power.feather')
-
-
-
-
-###############
-# Parallelized  extract spectral coherence
-###############
-
-def extract_spectral_coh(subject):
-    raw = mne.io.read_raw_edf('../eeg_data/main_edf/{}'.format(subject), infer_types=True, preload=True, misc=['Status'])
-    cleaned = light_preprocessing(raw)
-    cleaned = remove_bad_channels_kevin(cleaned,subject)
-
-    epoch_length = 10  # seconds
-    overlap = 2 # seconds
-
-    # Segment the raw data into epochs
-    # epochs shape (n_epochs, n_channels, n_times)
-    reject = dict(
-              eeg=1000e-6,      # unit: V (EEG channels)
-              )
-
-    flat = dict(eeg = 0.1e-6)
-
-    epochs = mne.make_fixed_length_epochs(cleaned,duration=epoch_length,overlap=overlap,preload=True)
-   
-    epochs.drop_bad(reject=reject, flat=flat, verbose=None)
-    if epochs.get_data().shape[0] < 1:
+    _, epochs, _, _ = load_clean_epochs(data_root, subject, epoch_length, overlap)
+    if len(epochs) < 1:
         return None
 
     all_features = []
+    sfreq = epochs.info["sfreq"]
+
     for bn in BAND_NAMES:
-        band = BAND_RANGE[bn]
-        sfreq = epochs.info['sfreq']  # the sampling frequency
-        tmin = 0.0  # exclude the baseline period
+        fmin, fmax = BAND_RANGE[bn]
         con = spectral_connectivity_epochs(
-            epochs, method='coh', mode='multitaper', sfreq=sfreq, fmin=band[0], fmax=band[1],
-            faverage=True, mt_adaptive=False)
-
-        coherence_matrix = pd.DataFrame(con.get_data(output='dense')[:,:,0], columns=epochs.ch_names, index=epochs.ch_names)
-        coherence_matrix = coherence_matrix.replace(0, np.nan)
-        series = coherence_matrix .stack(dropna=True)
-
-
-        col_names = [f'{i}_{j}' for i, j in series.index]
-
-        flattened_features = pd.DataFrame([series.values], columns=col_names)
-
-        flattened_features = flattened_features.add_prefix('{}_coh_'.format(bn))
-        all_features.append(flattened_features)
-    
+            epochs,
+            method="coh",
+            mode="multitaper",
+            sfreq=sfreq,
+            fmin=fmin,
+            fmax=fmax,
+            faverage=True, # average across the coherence values over all bins in that the band 
+            mt_adaptive=False,
+        )
+        # Value (i, j) is the coherence between channel i and channel j for this frequency band.
+        coh_mat = pd.DataFrame(
+            con.get_data(output="dense")[:, :, 0], columns=epochs.ch_names, index=epochs.ch_names
+        ).replace(0, np.nan)
+        # Create multi-index pandas series for coherence values
+        series = coh_mat.stack(dropna=True)  
+        col_names = [f"{i}_{j}" for (i, j) in series.index]
+        flat = pd.DataFrame([series.values], columns=col_names)
+        flat = flat.add_prefix(f"{bn}_coh_") # e.g. alpha_coh_F3_Pz
+        all_features.append(flat)
 
     result = pd.concat(all_features, axis=1)
-    result['subject'] = subject
+    result["subject"] = subject
     return result
 
 
-start_time = time.time()
-coh_df_list = Parallel(n_jobs=-1)(
-    delayed(extract_spectral_coh)(subject) for subject in good_subjects)
+def extract_sample_entropy(
+    subject,
+    data_root: str = "../eeg_data/main_edf",
+    epoch_length: int = DEFAULT_EPOCH_LENGTH,
+    overlap: int = DEFAULT_OVERLAP,
+):
+    """ Extracts sample entropy for each channel in each epoch and then averages across epochs.
+    Returns a DataFrame with average sample entropy"""
 
-end_time = time.time()
-print(end_time - start_time)
-
-all_coh_df_list = pd.concat(coh_df_list , axis=0)
-
-all_coh_df_list.reset_index().to_feather('all_spectral_coh.feather')
-
-
-
-
-###############
-# Parallelized  extract sample entropy
-###############
-
-
-def extract_sample_entropy(subject):
-    raw = mne.io.read_raw_edf('../eeg_data/main_edf/{}'.format(subject), infer_types=True, preload=True, misc=['Status'])
-    cleaned = light_preprocessing(raw)
-    cleaned = remove_bad_channels_kevin(cleaned,subject)
-
-    epoch_length = 10  # seconds
-    overlap = 2 # seconds
-
-    # Segment the raw data into epochs
-    # epochs shape (n_epochs, n_channels, n_times)
-    reject = dict(
-              eeg=1000e-6,      # unit: V (EEG channels)
-              )
-
-    flat = dict(eeg = 0.1e-6)
-
-    epochs = mne.make_fixed_length_epochs(cleaned,duration=epoch_length,overlap=overlap,preload=True)
-   
-    epochs.drop_bad(reject=reject, flat=flat, verbose=None)
-    if epochs.get_data().shape[0] < 1:
+    cleaned, epochs, _, _ = load_clean_epochs(data_root, subject, epoch_length, overlap)
+    if len(epochs) < 1:
         return None
 
     df_features = defaultdict(list)
 
     for i in range(len(epochs)):
-        # Getting the first segment
-        signal_i = epochs.get_data()[i,:,:] # shape = (n_channels, n_times)
+        signal_i = epochs.get_data()[i, :, :]  # (n_channels, n_times)
+        # Finds the indices of channels that are not entirely NaN in this epoch.
         good_channel_ids = np.where(~np.all(np.isnan(signal_i), axis=1))[0]
+       # If all channels are bad for this epoch, skip to the next epoch.
+        if len(good_channel_ids) == 0:
+            continue
 
-        # calculate sample entropy for all 19 channels
-        sample_entropy = compute_samp_entropy(signal_i[good_channel_ids])
-        good_channel_names = np.array(CHANNEL_NAMES_LIST)[good_channel_ids]
-        good_dict = {channel_name: entropy for channel_name, entropy in zip(good_channel_names, sample_entropy)}
+        samp_en = compute_samp_entropy(signal_i[good_channel_ids])
+        good_names = np.array(CHANNEL_NAMES_LIST)[good_channel_ids]
+        # Creates a dictionary mapping: Channel name to computed sample entropy value.
+        good_map = {ch: en for ch, en in zip(good_names, samp_en)}
 
-        df_features['subject'].append(subject)
-        df_features['epoch'].append(i)
+        df_features["subject"].append(subject)
+        df_features["epoch"].append(i)
         for ch in range(len(cleaned.ch_names)):
-            if CHANNEL_NAMES[ch] not in good_channel_names:
-                df_features[f'sample_EN_{CHANNEL_NAMES[ch]}'].append(np.nan)
-            else:  
-                df_features[f'sample_EN_{CHANNEL_NAMES[ch]}'].append(good_dict[CHANNEL_NAMES[ch]])
+            nm = CHANNEL_NAMES[ch]
+            df_features[f"sample_EN_{nm}"].append(good_map.get(nm, np.nan))
+
+    if len(df_features) == 0:
+        return None
 
     df_features = pd.DataFrame(df_features)
+    # Get average across epochs for each channel
     result = df_features.iloc[:, 2:].mean(axis=0).to_frame().T
-    result['subject'] = subject
+    result["subject"] = subject
     return result
 
 
+def extract_time_domain_statistical(
+    subject,
+    data_root: str = "../eeg_data/main_edf",
+    epoch_length: int = DEFAULT_EPOCH_LENGTH,
+    overlap: int = DEFAULT_OVERLAP,
+):
+    """ Extracts common time domain statistical features for each channel in each epoch and then averages across epochs.
+    Returns a DataFrame with average time domain features"""
 
-start_time = time.time()
-sampleEN_df_list = Parallel(n_jobs=-1)(
-    delayed(extract_sample_entropy)(subject) for subject in good_subjects)
-
-end_time = time.time()
-print(end_time - start_time)
-
-all_sampleEN_df_list = pd.concat(sampleEN_df_list , axis=0)
-
-all_sampleEN_df_list.reset_index().to_feather('all_sampleEN_df.feather')
-
-
-
-"""
-Extract statistical features: mean, SD, skewness, kurtosis
-"""
-
-def extract_statistical(subject):
-    raw = mne.io.read_raw_edf('../eeg_data/main_edf/{}'.format(subject), infer_types=True, preload=True, misc=['Status'])
-    cleaned = light_preprocessing(raw)
-    cleaned = remove_bad_channels_kevin(cleaned,subject)
-
-    epoch_length = 10  # seconds
-    overlap = 2 # seconds
-
-    # Segment the raw data into epochs
-    # epochs shape (n_epochs, n_channels, n_times)
-    reject = dict(
-              eeg=1000e-6,      # unit: V (EEG channels)
-              )
-
-    flat = dict(eeg = 0.1e-6)
-
-    epochs = mne.make_fixed_length_epochs(cleaned,duration=epoch_length,overlap=overlap,preload=True)
-   
-    epochs.drop_bad(reject=reject, flat=flat, verbose=None)
-    if epochs.get_data().shape[0] < 1:
+    cleaned, epochs, _, _ = load_clean_epochs(data_root, subject, epoch_length, overlap)
+    if len(epochs) < 1:
         return None
 
     df_features = defaultdict(list)
 
     for i in range(len(epochs)):
-        # Getting the first segment
-        signal_i = epochs.get_data()[i,:,:] # shape = (n_channels, n_times)
+        signal_i = epochs.get_data()[i, :, :]  # (n_channels, n_times)
         good_channel_ids = np.where(~np.all(np.isnan(signal_i), axis=1))[0]
+        if len(good_channel_ids) == 0:
+            continue
 
-        # calculate mean for all 19 channels
         mean = compute_mean(signal_i[good_channel_ids])
         sd = compute_std(signal_i[good_channel_ids])
         kurt = compute_kurtosis(signal_i[good_channel_ids])
         skew = compute_skewness(signal_i[good_channel_ids])
 
-        good_channel_names = np.array(CHANNEL_NAMES_LIST)[good_channel_ids]
-        good_dict_mean = {channel_name: avg for channel_name, avg in zip(good_channel_names, mean)}
-        good_dict_sd = {channel_name: std for channel_name, std in zip(good_channel_names, sd)}
-        good_dict_skew = {channel_name: skw for channel_name, skw in zip(good_channel_names, skew)}
-        good_dict_kurt = {channel_name: krt for channel_name, krt in zip(good_channel_names, kurt)}
+        good_names = np.array(CHANNEL_NAMES_LIST)[good_channel_ids]
+        map_mean = {n: v for n, v in zip(good_names, mean)}
+        map_sd = {n: v for n, v in zip(good_names, sd)}
+        map_kurt = {n: v for n, v in zip(good_names, kurt)}
+        map_skew = {n: v for n, v in zip(good_names, skew)}
 
-        df_features['subject'].append(subject)
-        df_features['epoch'].append(i)
+        df_features["subject"].append(subject)
+        df_features["epoch"].append(i)
         for ch in range(len(cleaned.ch_names)):
-            if CHANNEL_NAMES[ch] not in good_channel_names:
-                df_features[f'mean_{CHANNEL_NAMES[ch]}'].append(np.nan)
-                df_features[f'sd_{CHANNEL_NAMES[ch]}'].append(np.nan)
-                df_features[f'skew_{CHANNEL_NAMES[ch]}'].append(np.nan)
-                df_features[f'kurt_{CHANNEL_NAMES[ch]}'].append(np.nan)
+            nm = CHANNEL_NAMES[ch]
+            df_features[f"mean_{nm}"].append(map_mean.get(nm, np.nan))
+            df_features[f"sd_{nm}"].append(map_sd.get(nm, np.nan))
+            df_features[f"skew_{nm}"].append(map_skew.get(nm, np.nan))
+            df_features[f"kurt_{nm}"].append(map_kurt.get(nm, np.nan))
 
-            else:  
-                df_features[f'mean_{CHANNEL_NAMES[ch]}'].append(good_dict_mean[CHANNEL_NAMES[ch]])
-                df_features[f'sd_{CHANNEL_NAMES[ch]}'].append(good_dict_sd[CHANNEL_NAMES[ch]])
-                df_features[f'skew_{CHANNEL_NAMES[ch]}'].append(good_dict_skew[CHANNEL_NAMES[ch]])
-                df_features[f'kurt_{CHANNEL_NAMES[ch]}'].append(good_dict_kurt[CHANNEL_NAMES[ch]])
+    if len(df_features) == 0:
+        return None
 
     df_features = pd.DataFrame(df_features)
     result = df_features.iloc[:, 2:].mean(axis=0).to_frame().T
-    result['subject'] = subject
+    result["subject"] = subject
     return result
 
 
-start_time = time.time()
-statistical_df_list = Parallel(n_jobs=-1)(
-    delayed(extract_statistical)(subject) for subject in good_subjects)
-
-end_time = time.time()
-print(end_time - start_time)
-
-all_statistical_df_list = pd.concat(statistical_df_list , axis=0)
-
-all_statistical_df_list.reset_index().to_feather('all_statistical.feather')
-
-
-
-def extract_alpha_presence(subject):
-   
-    raw = mne.io.read_raw_edf('../eeg_data/main_edf/{}'.format(subject), infer_types=True, preload=True, misc=['Status'])
-    df_features = defaultdict(list)
-    df_features['subject'].append(subject)
-    # Preprocess the data using light_preprocessing and remove_bad_channels_kevin functions
-    cleaned = light_preprocessing(raw)
-    cleaned = remove_bad_channels_kevin(cleaned, subject)
-
-    epoch_length = 10  # seconds
-    overlap = 2 # seconds
-
-    # Segment the raw data into epochs and remove bad epochs
-    reject = dict(eeg=1000e-6)  # unit: V (EEG channels)
-    flat = dict(eeg=0.1e-6)
-    epochs = mne.make_fixed_length_epochs(cleaned, duration=epoch_length, overlap=overlap, preload=True)
-    epochs.drop_bad(reject=reject, flat=flat, verbose=None)
-    if epochs.get_data().shape[0] < 1:
-        df_features['alpha_presence'].append(np.nan)
-        return df_features
-
-    signal = epochs.get_data().transpose(1, 0, 2).reshape(epochs._data.shape[1], -1)
-
-    # Create an MNE Info object to describe the data
-    channel_names = epochs.ch_names
-    sfreq = epochs.info['sfreq']
-    info = mne.create_info(channel_names, sfreq, ch_types='eeg')
-
-    # Create an MNE RawEDF object from the signal and info
-    concatenated_epoch = mne.io.RawArray(signal, info)
-    result = philistine.mne.savgol_iaf(cleaned,picks=['O1','O2'], 
-                            fmin=8, fmax=12,pink_max_r2 =1)
- 
-    df_features['alpha_presence'].append(result.PeakAlphaFrequency is not None)
-    df_features = pd.DataFrame(df_features)
-    # Return True if peak alpha frequency is not None, indicating alpha wave presence, and False otherwise
-    return df_features
-
-start_time = time.time()
-alpha_df_list = Parallel(n_jobs=-1)(
-    delayed(extract_alpha_presence)(subject) for subject in good_subjects)
-
-end_time = time.time()
-print(end_time - start_time)
-
-all_alpha_df_list = pd.concat(alpha_df_list , axis=0)
-
-all_alpha_df_list.reset_index().to_feather('all_alpha.feather')
-
-
-all_alpha_df_list.head()
-
-
-
-def extract_length_after_dropped_epoch(subject):
-    raw = mne.io.read_raw_edf('../eeg_data/main_edf/{}'.format(subject), infer_types=True, preload=True, misc=['Status'])
-    cleaned = light_preprocessing(raw)
-    cleaned = remove_bad_channels_kevin(cleaned,subject)
-
-    original_length = cleaned._data.shape[1] / 256 / 60
-
-    epoch_length = 10  # seconds
-    overlap = 2 # seconds
-
-    # Segment the raw data into epochs
-    # epochs shape (n_epochs, n_channels, n_times)
-    reject = dict(
-              eeg=1000e-6,      # unit: V (EEG channels)
-              )
-
-    flat = dict(eeg = 0.1e-6)
-
-    epochs = mne.make_fixed_length_epochs(cleaned,duration=epoch_length,overlap=overlap,preload=True)
-   
-    n_epochs_before_drop = epochs.get_data().shape[0]
-    
-    epochs.drop_bad(reject=reject, flat=flat, verbose=None)
-    
-    n_epochs_after_drop = epochs.get_data().shape[0]
-    
-
-
-    length_remaining = n_epochs_after_drop * (epoch_length - overlap) / 60.0
-    
-    df = pd.DataFrame({'subject': [subject], 'length_remaining': [length_remaining], 'original_length': [original_length]})
-    
-    
-    return df
-
-
-start_time = time.time()
-length_df_list = Parallel(n_jobs=-1)(
-    delayed(extract_length_after_dropped_epoch)(subject) for subject in good_subjects)
-
-end_time = time.time()
-print(end_time - start_time)
-
-length_df_list = []
-for subject in good_subjects:
-    length_df_list.append(extract_length_after_dropped_epoch(subject))
-
-length_df = pd.concat(length_df_list , axis=0)
-
-
-length_df.to_csv('length_df.csv', index=False)
-
-################################
-# Sandbox #
-################################
-
-
-raw = mne.io.read_raw_edf('../eeg_data/main_edf/002.edf', infer_types=True, preload=True, misc=['Status'])
-cleaned = light_preprocessing(raw)
-cleaned = remove_bad_channels_kevin(cleaned,'002.edf')
-
-epoch_length = 10  # seconds
-overlap = 2 # seconds
-
-# Segment the raw data into epochs
-# epochs shape (n_epochs, n_channels, n_times)
-epochs = mne.make_fixed_length_epochs(cleaned,duration=epoch_length,overlap=overlap,preload=True)
-
-
-############## figure out the parameters in reject {} and flat {} ################
-psds, freqs = mne.time_frequency.psd_array_multitaper(epochs.get_data(), epochs.info['sfreq'],bandwidth=1)
-# take PSD between 0.5 to 40 Hz
-freq_ids = (freqs>=0.5)&(freqs<=40)
-psds = psds[:, :,freq_ids]
-freqs = freqs[freq_ids]
-
-ten_times_log_psd = 10 * np.log10(psds)
-ten_times_log_psd[np.isinf(ten_times_log_psd)] = np.nan
-ten_times_log_psd_mean = np.nanmean(ten_times_log_psd, axis=1)
-
-import matplotlib.pyplot as plt
-plt.style.use('seaborn-v0_8-white')
-plt.plot(ten_times_log_psd_mean.sum(axis=1))
-##################################################################################
-reject = dict(
-              eeg=1000e-6,      # unit: V (EEG channels)
-              )
-
-flat = dict(eeg = 0.1e-6)
-
-
-epochs.drop_bad(reject=reject, flat=flat, verbose=None)
-
-
-
-
-
-### Get features for one epoch
-signal_i = epochs.get_data()[0,:,:]
-#good_channel_ids = np.where(~np.all(np.isnan(signal_i), axis=1))[0]
-#psd_i, freq_i = mne.time_frequency.psd_array_multitaper(signal_i[good_channel_ids], epochs[0].info['sfreq'], fmin=0.5, fmax=42)
-psd_i, freq_i = mne.time_frequency.psd_array_multitaper(signal_i, epochs[0].info['sfreq'], fmin=0.5, fmax=42)
-
-
-#########################################
-# spectral coherence
-
-# Compute connectivity for band containing the evoked response.
-# We exclude the baseline period:
-fmin, fmax = 1,4
-
-
-
-#fmin = (1,4,8,13,30)
-#fmax = (4,8,13,30,42)
-
-sfreq = epochs.info['sfreq']  # the sampling frequency
-tmin = 0.0  # exclude the baseline period
-con = spectral_connectivity_epochs(
-    epochs, method='coh', mode='multitaper', sfreq=sfreq, fmin=fmin, fmax=fmax,
-    faverage=True, tmin=tmin, mt_adaptive=False, n_jobs=1)
-
-coherence_matrix = pd.DataFrame(con.get_data(output='dense')[:,:,0], columns=epochs.ch_names, index=epochs.ch_names)
-coherence_matrix = coherence_matrix.replace(0, np.nan)
-series = coherence_matrix .stack(dropna=True)
-
-# concatenate the levels of the MultiIndex to form the column names of the output row
-col_names = [f'{i}_{j}' for i, j in series.index]
-
-# create a new DataFrame with a single row
-flattened_features = pd.DataFrame([series.values], columns=col_names)
-
-flattened_features = flattened_features.add_prefix('{}_coh_'.format('delta'))
-# should have 171 columns
-
-
-
-# create a new DataFrame with the selected columns
-flattened_features.to_csv('coherence_flatten.csv')
-# create a Pandas series with the feature names and values
-
-plot_sensors_connectivity(
-    epochs.info,
-     con.get_data(output='dense')[:,:,0])
-#########################################
-df_features['epoch'].append(i)
-for bn in BAND_NAMES:
-        band = BAND_RANGE[bn]
-        # Find closest indices of band in frequency vector
-        idx_band = np.logical_and(freq_i >= band[0], freq_i <= band[1])
-        # Average power over frequencies
-        power = psd_i[:, idx_band].sum(axis=1)*np.mean(np.diff(freq_i[idx_band])) # power.shape=(n_channels,)
-        power_db = 10 * np.log10(power)
-        for ch in range(len(cleaned.ch_names)):
-            df_features[f'bp_{bn}_{ch}'].append(power_db[ch])
-
-
-
-df_features = pd.DataFrame(df_features)
-
-
-################################
-# Sample entropy
-subject = '041.edf'
-raw = mne.io.read_raw_edf('../eeg_data/main_edf/{}'.format(subject), infer_types=True, preload=True, misc=['Status'])
-cleaned = light_preprocessing(raw)
-cleaned = remove_bad_channels_kevin(cleaned,subject)
-
-epoch_length = 10  # seconds
-overlap = 2 # seconds
-
-# Segment the raw data into epochs
-# epochs shape (n_epochs, n_channels, n_times)
-reject = dict(
-            eeg=1000e-6,      # unit: V (EEG channels)
+def extract_alpha_presence(
+    subject,
+    data_root: str = "../eeg_data/main_edf",
+    epoch_length: int = DEFAULT_EPOCH_LENGTH,
+    overlap: int = DEFAULT_OVERLAP,
+):
+    """ detect alpha presence by finding Peak Alpha Frequency in occipital channels O1 and/or O2."""
+
+    cleaned, _, _, _ = load_clean_epochs(data_root, subject, epoch_length, overlap)
+
+    df = pd.DataFrame({"subject": [subject]})
+
+    try:
+        # Use channel names for O1/O2 if available
+        picks = []
+        for nm in ["O1", "O2"]:
+            if nm in cleaned.ch_names:
+                picks.append(nm)
+        if len(picks) == 0:
+            df["alpha_presence"] = np.nan
+            return df
+
+        res = philistine.mne.savgol_iaf(
+            cleaned, picks=picks, fmin=8, fmax=12, pink_max_r2=1
+        )
+        df["alpha_presence"] = res.PeakAlphaFrequency is not None
+        return df
+    except Exception:
+        logging.exception(f"Alpha presence failed for {subject}")
+        df["alpha_presence"] = np.nan
+        return df
+
+
+def extract_length_after_dropped_epoch(
+    subject,
+    data_root: str = "../eeg_data/main_edf",
+    epoch_length: int = DEFAULT_EPOCH_LENGTH,
+    overlap: int = DEFAULT_OVERLAP,
+):
+    cleaned, epochs, n_before, n_after = load_clean_epochs(
+        data_root, subject, epoch_length, overlap
+    )
+
+    # Original minutes (assumes 256 Hz if not present; prefer info if available)
+    sfreq = cleaned.info.get("sfreq", 256.0)
+    original_length_min = cleaned._data.shape[1] / float(sfreq) / 60.0
+
+    length_remaining_min = n_after * (epoch_length - overlap) / 60.0
+
+    return pd.DataFrame(
+        {
+            "subject": [subject],
+            "length_remaining_min": [length_remaining_min],
+            "original_length_min": [original_length_min],
+            "n_epochs_before": [n_before],
+            "n_epochs_after": [n_after],
+        }
+    )
+
+
+
+def _safe_parallel_map(fn, subjects, n_jobs, desc):
+    """Run a function over subjects in parallel"""
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_safe_wrap)(fn, s) for s in tqdm(subjects, desc=desc)
+    )
+    results = [r for r in results if r is not None]
+    if len(results) == 0:
+        return pd.DataFrame()
+    return pd.concat(results, axis=0, ignore_index=True)
+
+
+def _safe_wrap(fn, subject):
+    try:
+        return fn(subject)
+    except Exception as e:
+        logging.exception(f"Subject {subject} failed in {fn.__name__}: {e}")
+        return None
+
+
+def _merge_feature_tables(base_df: pd.DataFrame, tables: list[pd.DataFrame]) -> pd.DataFrame:
+    """Left-merge all feature tables on 'subject' starting from base_df."""
+    out = base_df.copy()
+    for t in tables:
+        if t is None or t.empty:
+            continue
+        # de-duplicate columns except 'subject'
+        dupes = [c for c in t.columns if c != "subject" and c in out.columns]
+        if dupes:
+            t = t.drop(columns=dupes)
+        out = out.merge(t, on="subject", how="left")
+    return out
+
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="EEG Feature Extraction CLI")
+    p.add_argument("--data-root", type=str, default="../eeg_data/main_edf",
+                   help="Directory containing EDF files.")
+    p.add_argument("--epoch-length", type=int, default=DEFAULT_EPOCH_LENGTH,
+                   help="Epoch length in seconds.")
+    p.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP,
+                   help="Overlap in seconds.")
+    p.add_argument("--n-jobs", type=int, default=-1,
+                   help="Parallel jobs for subject-level feature extraction.")
+    p.add_argument("--output", type=str, required=True,
+                   help="Output path for merged features (csv/parquet/feather).")
+    p.add_argument("--format", type=str, choices=["csv", "parquet", "feather"], default="feather",
+                   help="Output format.")
+    p.add_argument("--enable", type=str, nargs="*", default=["power", "coherence", "sample_entropy", "statistical", "alpha", "length"],
+                   help="Feature groups to enable: power, coherence, sample_entropy, statistical, alpha, length")
+    return p.parse_args()
+
+
+def resolve_subject_filepath(data_root: str):
+    """Resolve subject EDF file paths in the given data root directory."""
+    subs = [os.path.basename(p) for p in glob.glob(os.path.join(data_root, "*.edf"))]
+
+    if not subs:
+        logging.error(f"No EDF files found in: {data_root}")
+        sys.exit(2)
+    present = []
+    for s in subs:
+        if os.path.exists(edf_path(data_root, s)):
+            present.append(s)
+
+    if not present:
+        logging.error("No valid subjects found to process.")
+        sys.exit(2)
+
+    return sorted(present)
+
+
+def save_output(df: pd.DataFrame, path: str, fmt: str):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    if fmt == "csv":
+        df.to_csv(path, index=False)
+    elif fmt == "parquet":
+        df.to_parquet(path, index=False)
+    elif fmt == "feather":
+        df.reset_index(drop=True).to_feather(path)
+    logging.info(f"Wrote merged features to: {path} ({fmt})")
+
+
+def main():
+    args = parse_args()
+    start = time.time()
+
+    subjects = resolve_subject_filepath(args.data_root)
+    base = pd.DataFrame({"subject": subjects})
+    enabled = set([e.lower() for e in args.enable])
+    feature_tables = []
+
+    if "power" in enabled:
+        logging.info("Extracting relative power…")
+        feature_tables.append(
+            _safe_parallel_map(
+                lambda subject: extract_relative_power(subject, args.data_root, args.epoch_length, args.overlap),
+                subjects,
+                args.n_jobs,
+                "relative_power"
             )
+        )
 
-flat = dict(eeg = 0.1e-6)
-
-epochs = mne.make_fixed_length_epochs(cleaned,duration=epoch_length,overlap=overlap,preload=True)
-
-epochs.drop_bad(reject=reject, flat=flat, verbose=None)
-
-
-
-df_features = defaultdict(list)
-
-for i in range(len(epochs)):
-    # Getting the first segment
-    signal_i = epochs.get_data()[i,:,:] # shape = (n_channels, n_times)
-    good_channel_ids = np.where(~np.all(np.isnan(signal_i), axis=1))[0]
-
-    # calculate sample entropy for all 19 channels
-    sample_entropy = compute_samp_entropy(signal_i[good_channel_ids])
-    good_channel_names = np.array(CHANNEL_NAMES_LIST)[good_channel_ids]
-    good_dict = {channel_name: entropy for channel_name, entropy in zip(good_channel_names, sample_entropy)}
-
-    df_features['subject'].append(subject)
-    df_features['epoch'].append(i)
-    for ch in range(len(cleaned.ch_names)):
-        if CHANNEL_NAMES[ch] not in good_channel_names:
-            df_features[f'sample_EN_{CHANNEL_NAMES[ch]}'].append(np.nan)
-        else:  
-            df_features[f'sample_EN_{CHANNEL_NAMES[ch]}'].append(good_dict[CHANNEL_NAMES[ch]])
-
-df_features = pd.DataFrame(df_features)
-result = df_features.iloc[:, 2:].mean(axis=0).to_frame().T
-result['subject'] = subject
-
-
-
-
-############################### 
-# get whether have alpha
-
-#################################
-
-# pick O1 and O2 from epochs._data
-# pass it into philistine.mne.savgol_iaf
-
-
-signal = epochs.get_data().transpose(1, 0, 2).reshape(epochs._data.shape[1], -1)
-
-# Create an MNE Info object to describe the data
-channel_names = epochs.ch_names
-sfreq = epochs.info['sfreq']
-info = mne.create_info(channel_names, sfreq, ch_types='eeg')
-
-# Create an MNE RawEDF object from the signal and info
-concatenated_epoch = mne.io.RawArray(signal, info)
-result = philistine.mne.savgol_iaf(cleaned,picks=[4,13], 
-                          fmin=8, fmax=12)
-
-
-
-
-subject = "001.edf"
-raw = mne.io.read_raw_edf('../eeg_data/main_edf/{}'.format(subject), infer_types=True, preload=True, misc=['Status'])
-cleaned = light_preprocessing(raw)
-cleaned = remove_bad_channels_kevin(cleaned,subject)
-
-epoch_length = 10  # seconds
-overlap = 2 # seconds
-
-# Segment the raw data into epochs
-# epochs shape (n_epochs, n_channels, n_times)
-reject = dict(
-            eeg=1000e-6,      # unit: V (EEG channels)
+    if "coherence" in enabled:
+        logging.info("Extracting spectral coherence…")
+        feature_tables.append(
+            _safe_parallel_map(
+                lambda subject: extract_spectral_coh(subject, args.data_root, args.epoch_length, args.overlap),
+                subjects,
+                args.n_jobs,
+                "spectral_coherence"
             )
+        )
 
-flat = dict(eeg = 0.1e-6)
-
-epochs = mne.make_fixed_length_epochs(cleaned,duration=epoch_length,overlap=overlap,preload=True)
-
-n_epochs_before_drop = epochs.get_data().shape[0]
-
-epochs.drop_bad(reject=reject, flat=flat, verbose=None)
-
-
-
-
-
-subject = "335.edf"
-raw = mne.io.read_raw_edf('../eeg_data/main_edf/{}'.format(subject), infer_types=True, preload=True, misc=['Status'])
-cleaned = light_preprocessing(raw)
-cleaned = remove_bad_channels_kevin(cleaned,subject)
-
-original_length = cleaned._data.shape[1] / 256 / 60
-
-epoch_length = 10  # seconds
-overlap = 2 # seconds
-
-# Segment the raw data into epochs
-# epochs shape (n_epochs, n_channels, n_times)
-reject = dict(
-            eeg=1000e-6,      # unit: V (EEG channels)
+    if "sample_entropy" in enabled:
+        logging.info("Extracting sample entropy…")
+        feature_tables.append(
+            _safe_parallel_map(
+                lambda subject: extract_sample_entropy(subject, args.data_root, args.epoch_length, args.overlap),
+                subjects,
+                args.n_jobs,
+                "sample_entropy"
             )
+        )
 
-flat = dict(eeg = 0.1e-6)
+    if "statistical" in enabled:
+        logging.info("Extracting statistical features…")
+        feature_tables.append(
+            _safe_parallel_map(
+                lambda subject: extract_time_domain_statistical(subject, args.data_root, args.epoch_length, args.overlap),
+                subjects,
+                args.n_jobs,
+                "statistical"
+            )
+        )
 
-epochs = mne.make_fixed_length_epochs(cleaned,duration=epoch_length,overlap=overlap,preload=True)
+    if "alpha" in enabled:
+        logging.info("Detecting alpha presence…")
+        feature_tables.append(
+            _safe_parallel_map(
+                lambda subject: extract_alpha_presence(subject, args.data_root, args.epoch_length, args.overlap),
+                subjects,
+                args.n_jobs,
+                "alpha_presence"
+            )
+        )
 
-n_epochs_before_drop = epochs.get_data().shape[0]
+    if "length" in enabled:
+        logging.info("Computing remaining length after dropped epochs…")
+        feature_tables.append(
+            _safe_parallel_map(
+                lambda subject: extract_length_after_dropped_epoch(subject, args.data_root, args.epoch_length, args.overlap),
+                subjects,
+                args.n_jobs,
+                "length_after_drop"
+            )
+        )
 
-epochs.drop_bad(reject=reject, flat=flat, verbose=None)
+    merged = _merge_feature_tables(base, feature_tables)
+    save_output(merged, args.output, args.format)
+    logging.info(f"Done in {time.time() - start:.1f}s. Subjects processed: {len(subjects)}")
 
-n_epochs_after_drop = epochs.get_data().shape[0]
 
-if n_epochs_after_drop < 1:
-    return df_features
-
-length_remaining = n_epochs_after_drop * (epoch_length - overlap) / 60.0
+if __name__ == "__main__":
+    main()
