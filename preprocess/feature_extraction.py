@@ -42,7 +42,9 @@ DEFAULT_OVERLAP = 2        # seconds
 DEFAULT_REJECT = dict(eeg=1000e-6)
 DEFAULT_FLAT = dict(eeg=0.1e-6) #max peak-to-peak signal amplitude > 1000e-6 and min PTP < 0.1e-6
 
-### Preprocessing functions
+# -----------------------------
+# Preprocessing
+# -----------------------------
 def light_preprocessing(raw):
     """
     This function changes LE to A1, drops A1 and A2,
